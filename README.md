@@ -33,6 +33,15 @@ The system is currently implemented as a **Streamlit multipage application** wit
    uv sync 
    ```
 
+3. Activate virtual environment
+   ```bash
+   # For Linux / MacOS
+   source .venv/bin/activate
+
+   # For Windows
+   .venv/Scripts/activate
+   ```
+
 ## Running the System
 
 #### Option 1: Central Navigation Hub (Recommended)
@@ -40,7 +49,7 @@ The system is currently implemented as a **Streamlit multipage application** wit
 cd app
 streamlit run main.py
 ```
-This launches the central hub where you can navigate between all monitoring systems.
+This launches the main dashboard from where you can navigate between all monitoring systems.
 
 #### Option 2: Individual Component Access
 ```bash
@@ -53,12 +62,16 @@ streamlit run vibration_system.py  # Vibration monitoring
 
 #### Option 3: Docker Deployment
 ```bash
-# Build and run with Docker Compose
-docker-compose up --build
+cd deployment
+# Run with Docker Compose
+docker compose up -d
 
-# Or build individual container
-docker build -t dump-truck-monitor .
-docker run -p 8501:8501 dump-truck-monitor
+# Or build the container and run
+docker build -t dump-truck-sensor-monitoring .
+docker run -p 8501:8501 8502:8502 8503:8503 8504:8504 8505:8505 dump-truck-sensor-monitoring
+
+# To check logs
+docker compose logs
 ```
 
 #### Option 4: Quick Start Script
