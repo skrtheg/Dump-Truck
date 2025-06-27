@@ -9,6 +9,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.figure_factory as ff
 
+# Import for auto-refresh functionality
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 # --- Enhanced Configuration Constants ---
 SENSOR_METADATA = {
     # Engine System Sensors
@@ -774,82 +780,74 @@ st.session_state.selected_component = st.selectbox(
     index=default_component_index
 )
 
-# Placeholder for dynamic content
-main_dashboard_placeholder = st.empty()
+# --- Dashboard Navigation Section ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🚛 System Dashboards")
+st.sidebar.markdown("**Navigate to specialized dashboards:**")
 
-while st.session_state.auto_update_enabled:
-    with main_dashboard_placeholder.container():
-        # Global Metrics at the top
-        st.title("Dump Truck Fleet Monitoring")
-        
-        col_overall1, col_overall2, col_overall3, col_overall4, col_overall5 = st.columns(5)
-        
-        with col_overall1:
-            overall_health_score = st.session_state.performance_metrics.get("Overall Health", 100)
-            overall_health_color = "green" if overall_health_score >= 80 else ("orange" if overall_health_score >= 50 else "red")
-            st.markdown(f"**Overall Fleet Health**")
-            st.markdown(f"<h3 style='color:{overall_health_color}'>{overall_health_score:.1f}%</h3>", unsafe_allow_html=True)
-            
-        with col_overall2:
-            st.metric("Total Operating Hours", f"{st.session_state.performance_metrics.get('Operating Hours', 0):.1f} hrs")
-        with col_overall3:
-            st.metric("Critical Alerts", st.session_state.performance_metrics.get("Active Alerts", 0))
-        with col_overall4:
-            st.metric("Total Anomalies", st.session_state.performance_metrics.get("Anomalies Detected", 0))
-        with col_overall5:
-            st.metric("Operating Mode", st.session_state.operation_mode)
+# Dashboard URLs
+DASHBOARD_URLS = {
+    "🛑 Braking System": "http://localhost:8502",
+    "🔧 Engine System": "http://localhost:8503", 
+    "🛞 Tire System": "http://localhost:8504",
+    "📊 Vibration Analysis": "http://localhost:8505"
+}
 
-        st.markdown("---")
+# Create navigation buttons using st.link_button (opens in new tab)
+for dashboard_name, url in DASHBOARD_URLS.items():
+    st.sidebar.link_button(
+        dashboard_name, 
+        url, 
+        use_container_width=True
+    )
 
-        # Display Alerts
-        st.subheader("Active Alerts & Recommendations")
-        if st.session_state.alerts:
-            alert_df = pd.DataFrame(st.session_state.alerts)
-            alert_df["timestamp"] = alert_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            st.dataframe(alert_df, use_container_width=True, height=200, key="alerts_dataframe")
-        else:
-            st.info("No active alerts.", icon="ℹ️")
-        st.markdown("---")
+# Auto-refresh mechanism using streamlit-autorefresh
+if st.session_state.auto_update_enabled and st_autorefresh:
+    refresh_interval_ms = int(UPDATE_INTERVAL_SECONDS * 1000)  # Convert to milliseconds
+    st_autorefresh(interval=refresh_interval_ms, key="main_autorefresh")
 
-        # Hierarchical Sensor Monitoring Section - Pass the selected component
-        display_hierarchical_sensor_monitoring(st.session_state.selected_component)
+# Generate new data if auto-update is enabled and enough time has passed
+current_time = datetime.now()
+if (st.session_state.auto_update_enabled and 
+    (current_time - st.session_state.last_update_time).total_seconds() >= UPDATE_INTERVAL_SECONDS):
+    update_all_sensor_data()
+    st.session_state.last_update_time = current_time
 
-        # Update data and wait
-        update_all_sensor_data()
-        st.session_state.last_update_time = datetime.now()
-        time.sleep(UPDATE_INTERVAL_SECONDS)
+# Dashboard content (always displayed)
+st.title("Dump Truck Fleet Monitoring")
+
+col_overall1, col_overall2, col_overall3, col_overall4, col_overall5 = st.columns(5)
+
+with col_overall1:
+    overall_health_score = st.session_state.performance_metrics.get("Overall Health", 100)
+    overall_health_color = "green" if overall_health_score >= 80 else ("orange" if overall_health_score >= 50 else "red")
+    st.markdown(f"**Overall Fleet Health**")
+    st.markdown(f"<h3 style='color:{overall_health_color}'>{overall_health_score:.1f}%</h3>", unsafe_allow_html=True)
     
-else:
-    st.info("Auto-update is disabled. Please enable it from the sidebar to start real-time monitoring.")
-    # Display the last known state if auto-update is off
-    with main_dashboard_placeholder.container():
-        st.title("Dump Truck Fleet Monitoring (Static View)")
-        
-        col_overall1, col_overall2, col_overall3, col_overall4, col_overall5 = st.columns(5)
-        
-        with col_overall1:
-            overall_health_score = st.session_state.performance_metrics.get("Overall Health", 100)
-            overall_health_color = "green" if overall_health_score >= 80 else ("orange" if overall_health_score >= 50 else "red")
-            st.markdown(f"**Overall Fleet Health**")
-            st.markdown(f"<h3 style='color:{overall_health_color}'>{overall_health_score:.1f}%</h3>", unsafe_allow_html=True)
-        with col_overall2:
-            st.metric("Total Operating Hours", f"{st.session_state.performance_metrics.get('Operating Hours', 0):.1f} hrs")
-        with col_overall3:
-            st.metric("Critical Alerts", st.session_state.performance_metrics.get("Active Alerts", 0))
-        with col_overall4:
-            st.metric("Total Anomalies", st.session_state.performance_metrics.get("Anomalies Detected", 0))
-        with col_overall5:
-            st.metric("Operating Mode", st.session_state.operation_mode)
-        st.markdown("---")
+with col_overall2:
+    st.metric("Total Operating Hours", f"{st.session_state.performance_metrics.get('Operating Hours', 0):.1f} hrs")
+with col_overall3:
+    st.metric("Critical Alerts", st.session_state.performance_metrics.get("Active Alerts", 0))
+with col_overall4:
+    st.metric("Total Anomalies", st.session_state.performance_metrics.get("Anomalies Detected", 0))
+with col_overall5:
+    st.metric("Operating Mode", st.session_state.operation_mode)
 
-        # Display Alerts
-        st.subheader("Active Alerts & Recommendations")
-        if st.session_state.alerts:
-            alert_df = pd.DataFrame(st.session_state.alerts)
-            alert_df["timestamp"] = alert_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            st.dataframe(alert_df, use_container_width=True, height=200, key="static_alerts_dataframe")
-        else:
-            st.info("No active alerts.", icon="ℹ️")
-        st.markdown("---")
-        
-        display_hierarchical_sensor_monitoring(st.session_state.selected_component)
+st.markdown("---")
+
+# Display Alerts
+st.subheader("Active Alerts & Recommendations")
+if st.session_state.alerts:
+    alert_df = pd.DataFrame(st.session_state.alerts)
+    alert_df["timestamp"] = alert_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    st.dataframe(alert_df, use_container_width=True, height=200, key="alerts_dataframe")
+else:
+    st.info("No active alerts.", icon="ℹ️")
+st.markdown("---")
+
+# Hierarchical Sensor Monitoring Section - Pass the selected component
+display_hierarchical_sensor_monitoring(st.session_state.selected_component)
+
+# Show status message if auto-update is disabled
+if not st.session_state.auto_update_enabled:
+    st.info("Auto-update is disabled. Please enable it from the sidebar to start real-time monitoring.")

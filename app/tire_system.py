@@ -32,6 +32,12 @@ import plotly.graph_objs as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 
+# Import for auto-refresh functionality
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,9 +48,10 @@ logger = logging.getLogger(__name__)
 class Config:
     TIRE_POSITIONS: List[str] = None
     DB_FILE: str = 'tire_system.db'
-    SIM_INTERVAL: float = 1.0 # Reduced for faster updates
-    TRAINING_INTERVAL_SECONDS: int = 20 # Train models every 20 seconds
+    SIM_INTERVAL: float = 10 # Reduced for faster updates
+    TRAINING_INTERVAL_SECONDS: int = 180 # Train models every 3 minutes (reduced from 20 seconds)
     MIN_TRAINING_SAMPLES: int = 50 # Minimum samples needed to attempt ML training
+    MIN_SAMPLES_PER_CLASS: int = 10 # Minimum samples per status class for meaningful training
     MAX_MEMORY_SAMPLES: int = 1000 # Limit data fetched from DB for ML training and display
     BATCH_SIZE: int = 16 # Added batch size for LSTM training
 
@@ -442,7 +449,7 @@ class TireMLPipeline:
         }
 
         if len(np.unique(y_train)) < 2:
-            logger.warning("Not enough unique classes in training data for classification models. Skipping training.")
+            logger.info("Not enough unique classes in training data for classification models. Skipping training.")
             return
 
         for name, model in models_config.items():
@@ -476,9 +483,20 @@ class TireMLPipeline:
 
     def train_rul_model(self, X_all: np.ndarray, y_all: np.ndarray, df_original: pd.DataFrame):
         """
-        Train LSTM model for Remaining Useful Life prediction.
+        Train LSTM model for Remaining Useful Life prediction with improved error handling.
         """
         try:
+            # Validate input data
+            if len(X_all) < 50:
+                logger.info(f"Insufficient data for LSTM training: {len(X_all)} samples (need >=50)")
+                self.models['lstm'] = None
+                return
+                
+            if X_all.shape[1] != len(self.feature_columns):
+                logger.error(f"Feature dimension mismatch: {X_all.shape[1]} vs {len(self.feature_columns)}")
+                self.models['lstm'] = None
+                return
+
             # Generate synthetic RUL targets based on 'status' from df_original
             rul_targets = np.array([
                 1000 + np.random.normal(0, 50) if status == 'Normal' else
@@ -487,34 +505,49 @@ class TireMLPipeline:
                 for status in df_original['status']
             ])
 
-            sequence_length = 10
+            # Adaptive sequence length based on available data
+            sequence_length = min(10, len(X_all) // 4)  # Ensure we have enough sequences
+            if sequence_length < 5:
+                logger.info(f"Data insufficient for LSTM sequences (need at least 5 timesteps, have {sequence_length})")
+                self.models['lstm'] = None
+                return
+
             X_seq, y_seq = [], []
 
             for i in range(sequence_length, len(X_all)):
                 X_seq.append(X_all[i-sequence_length:i, :])
                 y_seq.append(rul_targets[i])
 
-            X_seq = np.array(X_seq)
-            y_seq = np.array(y_seq)
-
-            if X_seq.shape[0] == 0:
-                logger.warning(f"Not enough data ({len(X_all)} samples) to create LSTM sequences (need >={sequence_length}). Skipping RUL training.")
+            if len(X_seq) < 20:  # Need minimum sequences for meaningful training
+                logger.info(f"Not enough sequences ({len(X_seq)}) for LSTM training (need >=20). Skipping RUL training.")
                 self.models['lstm'] = None
                 return
 
+            X_seq = np.array(X_seq)
+            y_seq = np.array(y_seq)
+
             lstm_model = self.build_lstm_model((sequence_length, X_seq.shape[2]))
 
-            early_stopping = EarlyStopping(patience=5, restore_best_weights=True, monitor='val_loss')
+            early_stopping = EarlyStopping(patience=3, restore_best_weights=True, monitor='val_loss', verbose=0)
+
+            # Ensure we have enough data for train/test split
+            if len(X_seq) < 10:
+                logger.info("Not enough sequences for train/test split. Skipping LSTM training.")
+                self.models['lstm'] = None
+                return
 
             X_train_lstm, X_test_lstm, y_train_lstm, y_test_lstm = train_test_split(
                 X_seq, y_seq, test_size=0.2, random_state=42
             )
 
+            # Ensure batch size doesn't exceed training data size
+            effective_batch_size = min(config.BATCH_SIZE, len(X_train_lstm))
+            
             lstm_model.fit(
                 X_train_lstm, y_train_lstm,
                 validation_data=(X_test_lstm, y_test_lstm),
-                epochs=50,
-                batch_size=config.BATCH_SIZE,
+                epochs=15,  # Reduced epochs to prevent training issues
+                batch_size=effective_batch_size,
                 callbacks=[early_stopping],
                 verbose=0
             )
@@ -596,26 +629,28 @@ class TireMLPipeline:
                 status = f"Class_{most_common_pred_num}"
             avg_confidence = np.mean(confidences) * 100 # Convert to percentage
 
-        # RUL prediction (requires a sequence of data)
+        # RUL prediction (requires a sequence of data) with improved error handling
         rul_hours = 500.0 # Default RUL
         sequence_length = 10
 
         if 'lstm' in self.models and self.models['lstm'] is not None and len(df_processed_window) >= sequence_length * len(config.TIRE_POSITIONS):
-            # To get sequential data, we need to ensure enough timesteps across all tires,
-            # or just for one specific tire if we want tire-specific RUL.
-            # For simplicity, let's average features over each timestamp.
-            averaged_features_over_time = df_processed_window.groupby('timestamp')[self.feature_columns].mean().sort_index()
+            try:
+                # To get sequential data, we need to ensure enough timesteps across all tires,
+                # or just for one specific tire if we want tire-specific RUL.
+                # For simplicity, let's average features over each timestamp.
+                averaged_features_over_time = df_processed_window.groupby('timestamp')[self.feature_columns].mean().sort_index()
 
-            if len(averaged_features_over_time) >= sequence_length:
-                # Need to use the scaler that was fitted during training
-                lstm_input_sequence = self.scaler.transform(averaged_features_over_time.tail(sequence_length)).reshape(1, sequence_length, len(self.feature_columns))
-                try:
-                    rul_pred = self.models['lstm'].predict(lstm_input_sequence, verbose=0)[0][0]
+                if len(averaged_features_over_time) >= sequence_length:
+                    # Need to use the scaler that was fitted during training
+                    lstm_input_sequence = self.scaler.transform(averaged_features_over_time.tail(sequence_length)).reshape(1, sequence_length, len(self.feature_columns))
+                    
+                    # Safe LSTM prediction with fallback
+                    rul_pred = self._safe_lstm_predict(lstm_input_sequence)
                     rul_hours = max(0, rul_pred)
-                except Exception as e:
-                    logger.warning(f"Error predicting RUL with LSTM: {e}")
-            else:
-                logger.info(f"Not enough sequential data ({len(averaged_features_over_time)} timesteps) for LSTM RUL prediction (need {sequence_length}).")
+                else:
+                    logger.debug(f"Not enough sequential data ({len(averaged_features_over_time)} timesteps) for LSTM RUL prediction (need {sequence_length}).")
+            except Exception as e:
+                logger.warning(f"Error in RUL prediction pipeline: {e}, using default RUL")
 
         self.latest_prediction = PredictionResult(
             classification=status,
@@ -625,30 +660,51 @@ class TireMLPipeline:
         )
         return self.latest_prediction
 
+    def _safe_lstm_predict(self, input_sequence):
+        """Safe LSTM prediction with fallback to avoid 'pop from empty list' errors"""
+        try:
+            prediction = self.models['lstm'].predict(input_sequence, verbose=0)
+            if prediction is not None and len(prediction) > 0 and len(prediction[0]) > 0:
+                return prediction[0][0]
+            else:
+                logger.warning("LSTM returned empty prediction, using fallback")
+                return 500.0  # Default RUL
+        except Exception as e:
+            logger.warning(f"LSTM prediction failed: {e}, using fallback")
+            return 500.0  # Default RUL
+
     def train_models(self):
-        """Main training pipeline for all ML models."""
+        """Main training pipeline for all ML models with smart training logic."""
         try:
             df = self.db_manager.get_recent_data(limit=config.MAX_MEMORY_SAMPLES)
 
             if len(df) < config.MIN_TRAINING_SAMPLES:
-                st.info(f"💡 Collecting data for ML training: {len(df)}/{config.MIN_TRAINING_SAMPLES} samples. Please wait.")
-                self.models = {}
-                self.latest_prediction = None
+                logger.info(f"ML Training: Insufficient data for training: {len(df)} rows. Waiting...")
                 return
 
-            st.info(f"🏋️‍♀️ Training models with {len(df)} samples...")
+            # Smart training: Check data diversity before attempting training
+            unique_statuses = df['status'].nunique()
+            status_distribution = df['status'].value_counts()
+            
+            if unique_statuses < 2:
+                logger.info(f"ML Training: Only '{df['status'].iloc[0]}' status present. Skipping training until faults are injected.")
+                return
+                
+            # Ensure minimum samples per class for meaningful training
+            min_samples_per_class = min(status_distribution.values)
+            if min_samples_per_class < config.MIN_SAMPLES_PER_CLASS:
+                logger.info(f"ML Training: Insufficient samples per class (min: {min_samples_per_class}). Need at least {config.MIN_SAMPLES_PER_CLASS} samples per status.")
+                return
+
+            logger.info(f"Training models with {len(df)} samples across {unique_statuses} status types: {dict(status_distribution)}")
 
             X, y, df_processed = self.prepare_features(df)
 
-            if len(np.unique(y)) < 2:
-                logger.warning("Only one unique class in target variable 'status'. Cannot perform stratified split. Using non-stratified split.")
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=0.2, random_state=42
-                )
-            else:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=0.2, random_state=42, stratify=y
-                )
+            unique_classes = len(np.unique(y))
+            # With our smart checks above, we should always have multiple classes here
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
 
             self.train_classification_models(X_train, y_train, X_test, y_test)
             self.train_rul_model(X, y, df_processed)
@@ -659,7 +715,7 @@ class TireMLPipeline:
 
         except Exception as e:
             logger.error(f"Error in model training: {e}")
-            st.error(f"An error occurred during ML model training: {e}")
+            # Don't show error in UI to avoid disrupting dashboard
 
 
 # --- Streamlit Application Logic ---
@@ -716,7 +772,7 @@ def main():
 
         st.subheader("Data & Refresh")
         auto_refresh = st.checkbox("Auto Refresh Data", value=True, help="Automatically update sensor readings and dashboard.")
-        refresh_rate = st.slider("Refresh Interval (seconds)", 0.5, 5.0, config.SIM_INTERVAL, 0.5, help="Time between dashboard updates when auto-refresh is on.")
+        refresh_rate = st.slider("Refresh Interval (seconds)", 0.5, 5.0, 2.0, 0.5, help="Time between dashboard updates when auto-refresh is on.")
         
         st.subheader("Fault Injection")
         fault_options = {
@@ -753,42 +809,93 @@ def main():
 
         st.subheader("ML Model Training")
         if st.button("🏋️‍♀️ Train ML Models Now"):
-            with st.spinner("Training ML models... This might take a moment if data is scarce."):
-                ml_pipeline.train_models()
-            if ml_pipeline.latest_prediction:
-                st.success("ML models training complete and prediction updated!")
-            else:
-                st.warning("ML models trained, but no prediction could be made yet (e.g., insufficient data for prediction).")
+            with st.spinner("Training ML models... Checking data diversity..."):
+                # Check current data status before training
+                current_df = ml_pipeline.db_manager.get_recent_data(limit=100)
+                if not current_df.empty:
+                    unique_statuses = current_df['status'].nunique()
+                    if unique_statuses < 2:
+                        st.warning(f"⚠️ All data shows '{current_df['status'].iloc[0]}' status. Inject faults first for meaningful ML training.")
+                    else:
+                        ml_pipeline.train_models()
+                        if ml_pipeline.latest_prediction:
+                            st.success("✅ ML models training complete and prediction updated!")
+                        elif ml_pipeline.models:
+                            st.success("✅ ML models trained successfully!")
+                        else:
+                            st.info("ℹ️ Training completed, but models need more diverse data for predictions.")
+                else:
+                    st.error("No data available for training.")
         
         st.markdown("---")
         show_raw_data = st.checkbox("Show Raw Data Table", value=False)
         show_db_stats = st.checkbox("Show Database Stats", value=False) # Not directly used in display, can remove or use for debug
 
 
-    # --- Data Generation & ML Training Logic (Streamlit's main loop) ---
+    # Auto-refresh mechanism using streamlit-autorefresh
+    if auto_refresh and st_autorefresh:
+        # Check if we have data to determine refresh rate
+        try:
+            has_data = len(db_manager.get_recent_data(limit=1)) > 0
+            current_refresh_rate = refresh_rate if has_data else 1.0  # Faster refresh during initialization
+        except:
+            current_refresh_rate = 1.0  # Default to fast refresh if we can't check
+        
+        refresh_interval_ms = int(current_refresh_rate * 1000)  # Convert to milliseconds
+        st_autorefresh(interval=refresh_interval_ms, key="tire_autorefresh")
+
+    # --- Data Generation & ML Training Logic ---
     current_time = datetime.now()
 
-    # Data generation
-    if (current_time - st.session_state.last_data_gen_time).total_seconds() >= refresh_rate:
-        new_readings = simulator.generate_tire_data()
-        db_manager.insert_readings(new_readings)
-        st.session_state.last_data_gen_time = current_time
-        st.rerun() # Force a rerun to update the dashboard with new data
+    # Data generation - ensure it happens even on first load
+    should_generate = (
+        auto_refresh and 
+        (current_time - st.session_state.last_data_gen_time).total_seconds() >= refresh_rate
+    )
+    
+    # Check if we have any data at all, if not, force generation
+    try:
+        existing_data_count = len(db_manager.get_recent_data(limit=1))
+        if existing_data_count == 0:
+            should_generate = True
+    except:
+        should_generate = True
+    
+    if should_generate:
+        try:
+            new_readings = simulator.generate_tire_data()
+            if new_readings:
+                db_manager.insert_readings(new_readings)
+                st.session_state.last_data_gen_time = current_time
+        except Exception as e:
+            logger.error(f"Error generating tire data: {e}")
 
     # ML model training trigger
     if (current_time - st.session_state.last_ml_train_time).total_seconds() >= config.TRAINING_INTERVAL_SECONDS:
         ml_pipeline.train_models()
         st.session_state.last_ml_train_time = current_time
-        # No explicit rerun needed here, as data generation already triggers it frequently
-
 
     # Fetch data for display
     df_all_data = db_manager.get_recent_data(limit=config.MAX_MEMORY_SAMPLES)
 
     if df_all_data.empty:
-        st.info("⏳ Initializing tire monitoring system... Please wait for data to accumulate.")
-        time.sleep(refresh_rate) # Small sleep to avoid busy-waiting too much
-        st.rerun() # Re-run to check for data
+        st.info("⏳ Initializing tire monitoring system... Generating initial data...")
+        # Force generate some initial data if none exists
+        try:
+            for _ in range(5):  # Generate several readings to get started
+                new_readings = simulator.generate_tire_data()
+                if new_readings:
+                    db_manager.insert_readings(new_readings)
+            
+            # If auto-refresh is enabled, let it handle the refresh
+            if auto_refresh and st_autorefresh:
+                st.info("✅ Initial data generated! Dashboard will refresh automatically...")
+            else:
+                # Only use rerun if auto-refresh is not available/enabled
+                st.rerun()
+                
+        except Exception as e:
+            st.error(f"Error initializing data: {e}")
         return
 
     # Prepare data for display and ML prediction
@@ -1040,7 +1147,17 @@ def main():
             st.plotly_chart(fig_status, use_container_width=True)
 
         else:
-            st.warning("ML models not yet trained or no predictions available. Please trigger training via the sidebar.")
+            st.info("""
+            🤖 **ML Models Status**: Ready for training
+            
+            💡 **To enable predictive analytics:**
+            1. Use the sidebar to inject tire faults (pressure loss, tread wear, or overheating)
+            2. Let the system collect diverse data for a few minutes
+            3. Models will train automatically when sufficient data diversity exists
+            4. Or manually trigger training using the "Train ML Models Now" button
+            
+            ℹ️ **Current Status**: All tires showing normal conditions - ML models need fault data for meaningful training.
+            """)
 
     # Raw data table
     if show_raw_data:

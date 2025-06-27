@@ -14,6 +14,12 @@ from sklearn.metrics import accuracy_score
 import warnings
 import os
 
+# Import for auto-refresh functionality
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -1006,7 +1012,7 @@ with tab7: # Sensor Thresholds
         st.success("Sensor anomaly thresholds updated! Rerunning simulation with new thresholds.")
         st.rerun()
 
-# Auto-refresh mechanism
-if auto_refresh:
-    time.sleep(refresh_rate)
-    st.rerun()
+# Auto-refresh mechanism using streamlit-autorefresh
+if auto_refresh and st_autorefresh:
+    refresh_interval_ms = int(refresh_rate * 1000)  # Convert to milliseconds
+    st_autorefresh(interval=refresh_interval_ms, key="engine_autorefresh")

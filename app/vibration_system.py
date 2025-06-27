@@ -14,6 +14,12 @@ from sklearn.metrics import accuracy_score
 import warnings
 import os
 
+# Import for auto-refresh functionality
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 # Suppress TensorFlow logging and other warnings
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -1006,6 +1012,7 @@ with footer_col3:
     st.write(f"Last Update: {latest['timestamp']}")
     st.write(f"Auto Refresh: {'✅ On' if auto_refresh else '❌ Off'}")
 
-# Auto-refresh logic
-if auto_refresh:
-    time.sleep(0.1)  # Small delay to prevent excessive CPU usage
+# Auto-refresh mechanism using streamlit-autorefresh
+if auto_refresh and st_autorefresh:
+    refresh_interval_ms = int(refresh_rate * 1000)  # Convert to milliseconds
+    st_autorefresh(interval=refresh_interval_ms, key="vibration_autorefresh")

@@ -16,6 +16,12 @@ import os
 import json
 import logging
 
+# Import for auto-refresh functionality
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,7 +30,7 @@ logger = logging.getLogger(__name__)
 CONFIG = {
     'csv_file': 'brake_system_data.csv',
     'ml_results_file': 'ml_predictions.json', # File to store ML results
-    'sim_interval': 1,   # Faster updates for realistic simulation
+    'sim_interval': 10,   # Faster updates for realistic simulation
     'model_retrain_interval': 20, # How often ML model retrains (seconds)
     'data_window': 100 # Number of data points to display in historical charts
 }
@@ -680,6 +686,208 @@ def create_sensor_dashboard_section(sensor_key, sensor_config, latest_data, df):
     st.markdown("---")
 
 
+def generate_and_save_data():
+    """Generate new brake data point and save to CSV"""
+    # Initialize timestep if not exists
+    if 'simulation_timestep' not in st.session_state:
+        st.session_state.simulation_timestep = 0
+    
+    current_time = datetime.now()
+    
+    # Increment timestep for dynamic effects
+    st.session_state.simulation_timestep += 1
+
+    # Generate new data point
+    brake_data = generate_brake_data(st.session_state, current_timestep=st.session_state.simulation_timestep)
+    
+    # Create DataFrame for current reading
+    new_row = pd.DataFrame([[
+        current_time.strftime('%Y-%m-%d %H:%M:%S'),
+        round(brake_data['brake_pressure'], 2),
+        round(brake_data['brake_temperature'], 2),
+        round(brake_data['brake_pad_wear'], 1),
+        round(brake_data['brake_response_time'], 3),
+        brake_data['condition']
+    ]], columns=[
+        'timestamp', 'brake_pressure', 'brake_temperature',
+        'brake_pad_wear', 'brake_response_time', 'condition'
+    ])
+
+    # Append to CSV
+    try:
+        new_row.to_csv(CONFIG['csv_file'], mode='a', header=False, index=False)
+    except Exception as e:
+        logger.error(f"Error appending data to CSV: {e}")
+
+
+def render_dashboard_content(show_raw_data, show_ml_metrics):
+    """Render all dashboard content tabs"""
+    # Load all data for display and ML
+    df = pd.DataFrame()
+    try:
+        if os.path.exists(CONFIG['csv_file']):
+            df = pd.read_csv(CONFIG['csv_file'])
+            df = clean_and_validate_data(df)
+        
+        if df.empty:
+            st.info("No data yet. Please wait for the simulation to start. (Data accumulating...)")
+            return
+        
+        latest_data = df.iloc[-1]
+
+    except pd.errors.EmptyDataError:
+        st.info("CSV file is empty. Waiting for simulation data to be written...")
+        return
+    except Exception as e:
+        st.error(f"Error loading or processing data for display: {e}. Please try resetting the system using the sidebar button.")
+        return
+
+    # Load ML results from file (updated by the background ML thread)
+    pred_from_file, accuracy_from_file = load_ml_results()
+    if pred_from_file is not None and accuracy_from_file is not None:
+        st.session_state.latest_prediction = pred_from_file
+        st.session_state.model_accuracy = accuracy_from_file
+
+    # Create dashboard tabs
+    tab_overview, tab_pressure, tab_temp, tab_pad_wear, tab_response_time, tab_predictive = st.tabs([
+        "Overview", 
+        f"{SENSOR_CONFIG['brake_pressure']['icon']} {SENSOR_CONFIG['brake_pressure']['name']}",
+        f"{SENSOR_CONFIG['brake_temperature']['icon']} {SENSOR_CONFIG['brake_temperature']['name']}",
+        f"{SENSOR_CONFIG['brake_pad_wear']['icon']} {SENSOR_CONFIG['brake_pad_wear']['name']}",
+        f"{SENSOR_CONFIG['brake_response_time']['icon']} {SENSOR_CONFIG['brake_response_time']['name']}",
+        "🧠 Predictive Analytics"
+    ])
+
+    with tab_overview:
+        st.header("✨ Overall System Status & Key Metrics")
+        overall_health_color = "green"
+        if st.session_state.current_system_health == 'Warning':
+            overall_health_color = "orange"
+        elif st.session_state.current_system_health == 'Fault':
+            overall_health_color = "red"
+        
+        st.markdown(f"""
+        <div style="background-color: {overall_health_color}; padding: 15px; border-radius: 10px; text-align: center; color: white;">
+            <h3>Overall Brake System Health: <b>{st.session_state.current_system_health}</b></h3>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("")
+
+        st.subheader("Current Key Sensor Readings")
+        cols_metrics = st.columns(4)
+        
+        for i, (key, s_config) in enumerate(SENSOR_CONFIG.items()):
+            current_val = latest_data[key]
+            cols_metrics[i].metric(
+                label=f"{s_config['icon']} {s_config['name']}",
+                value=f"{current_val:.2f} {s_config['unit']}"
+            )
+        st.markdown("---")
+
+        st.subheader("Recent Data Trends (All Sensors)")
+        fig_all_trends = make_subplots(rows=len(SENSOR_CONFIG), cols=1, 
+                                     shared_xaxes=True, 
+                                     vertical_spacing=0.08,
+                                     subplot_titles=[f"{s['name']} ({s['unit']})" for s in SENSOR_CONFIG.values()])
+        
+        display_df_all = df.tail(CONFIG['data_window'])
+
+        for i, (key, s_config) in enumerate(SENSOR_CONFIG.items()):
+            current_sensor_value = latest_data[key]
+            
+            line_color = "green"
+            if s_config['threshold_key'] == 'pressure':
+                if current_sensor_value < THRESHOLDS[s_config['threshold_key']]['critical_min']:
+                    line_color = "red"
+                elif current_sensor_value < THRESHOLDS[s_config['threshold_key']]['warning_min']:
+                    line_color = "orange"
+            else:
+                if current_sensor_value > THRESHOLDS[s_config['threshold_key']]['critical_max']:
+                    line_color = "red"
+                elif current_sensor_value > THRESHOLDS[s_config['threshold_key']]['warning_max']:
+                    line_color = "orange"
+
+            fig_all_trends.add_trace(go.Scatter(
+                x=display_df_all['timestamp'], 
+                y=display_df_all[key], 
+                name=s_config['name'], 
+                mode='lines', 
+                line=dict(color=line_color, width=2),
+                showlegend=True
+            ), row=i+1, col=1)
+
+            if s_config['threshold_key'] == 'pressure':
+                fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['normal_min'], line_dash="dot", line_color="lightgreen", row=i+1, col=1)
+                fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['warning_min'], line_dash="dash", line_color="orange", row=i+1, col=1)
+                fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['critical_min'], line_dash="dash", line_color="red", row=i+1, col=1)
+            else:
+                fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['normal_max'], line_dash="dot", line_color="lightgreen", row=i+1, col=1)
+                fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['warning_max'], line_dash="dash", line_color="orange", row=i+1, col=1)
+                fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['critical_max'], line_dash="dash", line_color="red", row=i+1, col=1)
+            
+            fig_all_trends.update_yaxes(title_text=s_config['unit'], row=i+1, col=1)
+
+        fig_all_trends.update_layout(height=800, title_text="Live Trend Data Across All Brake Sensors", showlegend=False)
+        st.plotly_chart(fig_all_trends, use_container_width=True)
+
+    with tab_pressure:
+        create_sensor_dashboard_section('brake_pressure', SENSOR_CONFIG['brake_pressure'], latest_data, df)
+
+    with tab_temp:
+        create_sensor_dashboard_section('brake_temperature', SENSOR_CONFIG['brake_temperature'], latest_data, df)
+
+    with tab_pad_wear:
+        create_sensor_dashboard_section('brake_pad_wear', SENSOR_CONFIG['brake_pad_wear'], latest_data, df)
+
+    with tab_response_time:
+        create_sensor_dashboard_section('brake_response_time', SENSOR_CONFIG['brake_response_time'], latest_data, df)
+
+    with tab_predictive:
+        st.header("🧠 Predictive Maintenance & Anomaly Detection")
+        if st.session_state.latest_prediction:
+            pred = st.session_state.latest_prediction
+            col_pred1, col_pred2, col_pred3 = st.columns(3)
+            
+            pred_card_color = "lightgreen"
+            if pred['condition'] == 'Warning':
+                pred_card_color = "orange"
+            elif pred['condition'] == 'Fault':
+                pred_card_color = "red"
+
+            with col_pred1:
+                st.markdown(f"""
+                <div style="background-color: {pred_card_color}; padding: 15px; border-radius: 10px; text-align: center; color: white;">
+                    <h4>Predicted Brake Health</h4>
+                    <h2>{pred['condition']}</h2>
+                    <p>Confidence: {pred['confidence']:.1f}%</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col_pred2:
+                st.info(f"""
+                **Estimated Remaining Useful Life (RUL)**
+                ## {pred['rul']} Hours
+                """)
+            
+            with col_pred3:
+                st.info(f"""
+                **Anomaly Count**
+                ## {st.session_state.anomaly_count}
+                """)
+            
+            if show_ml_metrics:
+                st.subheader("ML Model Performance")
+                st.metric("Model Accuracy", f"{st.session_state.model_accuracy:.1f}%")
+                st.markdown("*(Accuracy based on recent historical data)*")
+
+        else:
+            st.info("ML model predictions will appear here after sufficient data is collected and models are trained. Please wait or click 'TRAIN ML MODELS NOW'.")
+
+    if show_raw_data:
+        st.subheader("Raw Data Table (Last 20 readings)")
+        st.dataframe(df.tail(20), use_container_width=True)
+
+
 def create_dashboard():
     """
     Constructs the Streamlit web application dashboard.
@@ -695,9 +903,9 @@ def create_dashboard():
     if not st.session_state.ml_thread_running:
         logger.info("Starting ML training thread...")
         ml_thread = threading.Thread(target=ml_training_thread_func)
-        ml_thread.daemon = True # Daemon threads exit when the main program exits
+        ml_thread.daemon = True
         ml_thread.start()
-        st.session_state.ml_thread_running = True # Set flag to indicate thread is running
+        st.session_state.ml_thread_running = True
 
     # --- Ensure CSV file exists with headers immediately on startup ---
     if not os.path.exists(CONFIG['csv_file']):
@@ -706,9 +914,22 @@ def create_dashboard():
             'brake_pad_wear', 'brake_response_time', 'condition'
         ]).to_csv(CONFIG['csv_file'], index=False)
         st.info("Brake system data file created. Waiting for simulation data to accumulate in charts...")
-        time.sleep(0.5) # Give a small moment for file system to write
-        st.rerun() # Rerun once to immediately process the created file
-        return # Exit this rerun to let the next one process the file
+        return
+
+    # Auto-refresh functionality - generates data and refreshes display
+    if st_autorefresh is not None:
+        # Auto-refresh every 1000ms (1 second) - matches CONFIG['sim_interval']
+        refresh_count = st_autorefresh(interval=CONFIG['sim_interval'] * 1000, key="brake_monitor_refresh")
+        
+        # Generate and save new data on each refresh
+        generate_and_save_data()
+    else:
+        st.warning("⚠️ Auto-refresh not available. Install with: `pip install streamlit-autorefresh`")
+        st.info("Manual refresh: Use the browser refresh button or add refresh controls.")
+        
+        # Fallback: Manual refresh button
+        if st.button("🔄 Refresh Data", key="manual_refresh"):
+            generate_and_save_data()
 
     # Sidebar controls for system interaction
     with st.sidebar:
@@ -732,13 +953,12 @@ def create_dashboard():
                 st.session_state.emergency_brake_active = True
                 st.session_state.system_mode = 'Emergency'
                 st.info("Emergency brake activated! Expect higher pressure and temperature readings.")
-                # No explicit rerun needed, as the main loop refreshes anyway
+                
         with col2_rs:
             if st.button("🔄 RESET SYSTEM", type="secondary", key="reset_system_btn"):
                 reset_system(st.session_state)
                 st.success("System reset to normal!")
                 st.session_state.fault_injection_enabled = True
-                # No explicit rerun needed, as the main loop refreshes anyway
         
         st.markdown("---")
 
@@ -788,7 +1008,6 @@ def create_dashboard():
         st.markdown("---")
 
         st.subheader("🤖 ML Model Training")
-        # ML training runs periodically in a background thread. This button is for user info.
         if st.button("🏋️‍♀️ TRAIN ML MODELS NOW", key="train_ml_btn"):
             st.info("ML training initiated in the background. Check 'Predictive Analytics' tab for updates (models train every 20 seconds).")
 
@@ -797,225 +1016,8 @@ def create_dashboard():
         show_raw_data = st.checkbox("Show Raw Data Table", value=False, key="show_raw_data_checkbox")
         show_ml_metrics = st.checkbox("Show ML Metrics Details", value=True, key="show_ml_metrics_checkbox")
 
-    # --- Main Dashboard Content Loop ---
-    # Use a placeholder to update content dynamically
-    dashboard_placeholder = st.empty()
-
-    # This loop now drives the data generation and dashboard refresh
-    # The 'timestep' for sin function needs a consistent, increasing value, not just time.time()
-    # Let's use a simple counter for now, reset on app start/reset
-    if 'simulation_timestep' not in st.session_state:
-        st.session_state.simulation_timestep = 0
-
-    while True:
-        current_time = datetime.now()
-        
-        # Increment timestep for dynamic effects
-        st.session_state.simulation_timestep += 1
-
-        # Generate new data point
-        brake_data = generate_brake_data(st.session_state, current_timestep=st.session_state.simulation_timestep)
-        
-        # Create DataFrame for current reading
-        new_row = pd.DataFrame([[
-            current_time.strftime('%Y-%m-%d %H:%M:%S'),
-            round(brake_data['brake_pressure'], 2),
-            round(brake_data['brake_temperature'], 2),
-            round(brake_data['brake_pad_wear'], 1),
-            round(brake_data['brake_response_time'], 3),
-            brake_data['condition']
-        ]], columns=[
-            'timestamp', 'brake_pressure', 'brake_temperature',
-            'brake_pad_wear', 'brake_response_time', 'condition'
-        ])
-
-        # Append to CSV
-        try:
-            new_row.to_csv(CONFIG['csv_file'], mode='a', header=False, index=False)
-        except Exception as e:
-            logger.error(f"Error appending data to CSV: {e}")
-
-        # Load all data for display and ML
-        df = pd.DataFrame() # Initialize empty DataFrame
-        try:
-            if os.path.exists(CONFIG['csv_file']):
-                df = pd.read_csv(CONFIG['csv_file'])
-                df = clean_and_validate_data(df)
-            
-            if df.empty:
-                with dashboard_placeholder.container():
-                    st.info("No data yet. Please wait for the simulation to start. (Data accumulating...)")
-                time.sleep(CONFIG['sim_interval'])
-                st.rerun()
-                continue
-            
-            latest_data = df.iloc[-1]
-
-        except pd.errors.EmptyDataError:
-            with dashboard_placeholder.container():
-                st.info("CSV file is empty. Waiting for simulation data to be written...")
-            time.sleep(CONFIG['sim_interval'])
-            st.rerun()
-            continue
-        except Exception as e:
-            with dashboard_placeholder.container():
-                st.error(f"Error loading or processing data for display: {e}. Please try resetting the system using the sidebar button.")
-            time.sleep(CONFIG['sim_interval'])
-            st.rerun()
-            continue
-
-        # Load ML results from file (updated by the background ML thread)
-        pred_from_file, accuracy_from_file = load_ml_results()
-        if pred_from_file is not None and accuracy_from_file is not None:
-            st.session_state.latest_prediction = pred_from_file
-            st.session_state.model_accuracy = accuracy_from_file
-
-        # Update the dashboard using the placeholder
-        with dashboard_placeholder.container():
-            st.empty() 
-
-            tab_overview, tab_pressure, tab_temp, tab_pad_wear, tab_response_time, tab_predictive = st.tabs([
-                "Overview", 
-                f"{SENSOR_CONFIG['brake_pressure']['icon']} {SENSOR_CONFIG['brake_pressure']['name']}",
-                f"{SENSOR_CONFIG['brake_temperature']['icon']} {SENSOR_CONFIG['brake_temperature']['name']}",
-                f"{SENSOR_CONFIG['brake_pad_wear']['icon']} {SENSOR_CONFIG['brake_pad_wear']['name']}",
-                f"{SENSOR_CONFIG['brake_response_time']['icon']} {SENSOR_CONFIG['brake_response_time']['name']}",
-                "🧠 Predictive Analytics"
-            ])
-
-            with tab_overview:
-                st.header("✨ Overall System Status & Key Metrics")
-                overall_health_color = "green"
-                if st.session_state.current_system_health == 'Warning':
-                    overall_health_color = "orange"
-                elif st.session_state.current_system_health == 'Fault':
-                    overall_health_color = "red"
-                
-                st.markdown(f"""
-                <div style="background-color: {overall_health_color}; padding: 15px; border-radius: 10px; text-align: center; color: white;">
-                    <h3>Overall Brake System Health: <b>{st.session_state.current_system_health}</b></h3>
-                </div>
-                """, unsafe_allow_html=True)
-                st.markdown("")
-
-                st.subheader("Current Key Sensor Readings")
-                cols_metrics = st.columns(4)
-                
-                for i, (key, s_config) in enumerate(SENSOR_CONFIG.items()):
-                    current_val = latest_data[key]
-                    cols_metrics[i].metric(
-                        label=f"{s_config['icon']} {s_config['name']}",
-                        value=f"{current_val:.2f} {s_config['unit']}"
-                    )
-                st.markdown("---")
-
-                st.subheader("Recent Data Trends (All Sensors)")
-                fig_all_trends = make_subplots(rows=len(SENSOR_CONFIG), cols=1, 
-                                             shared_xaxes=True, 
-                                             vertical_spacing=0.08,
-                                             subplot_titles=[f"{s['name']} ({s['unit']})" for s in SENSOR_CONFIG.values()])
-                
-                display_df_all = df.tail(CONFIG['data_window'])
-
-                for i, (key, s_config) in enumerate(SENSOR_CONFIG.items()):
-                    current_sensor_value = latest_data[key]
-                    
-                    line_color = "green"
-                    if s_config['threshold_key'] == 'pressure':
-                        if current_sensor_value < THRESHOLDS[s_config['threshold_key']]['critical_min']:
-                            line_color = "red"
-                        elif current_sensor_value < THRESHOLDS[s_config['threshold_key']]['warning_min']:
-                            line_color = "orange"
-                    else:
-                        if current_sensor_value > THRESHOLDS[s_config['threshold_key']]['critical_max']:
-                            line_color = "red"
-                        elif current_sensor_value > THRESHOLDS[s_config['threshold_key']]['warning_max']:
-                            line_color = "orange"
-
-                    fig_all_trends.add_trace(go.Scatter(
-                        x=display_df_all['timestamp'], 
-                        y=display_df_all[key], 
-                        name=s_config['name'], 
-                        mode='lines', 
-                        line=dict(color=line_color, width=2),
-                        showlegend=True
-                    ), row=i+1, col=1)
-
-                    if s_config['threshold_key'] == 'pressure':
-                        fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['normal_min'], line_dash="dot", line_color="lightgreen", row=i+1, col=1)
-                        fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['warning_min'], line_dash="dash", line_color="orange", row=i+1, col=1)
-                        fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['critical_min'], line_dash="dash", line_color="red", row=i+1, col=1)
-                    else:
-                        fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['normal_max'], line_dash="dot", line_color="lightgreen", row=i+1, col=1)
-                        fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['warning_max'], line_dash="dash", line_color="orange", row=i+1, col=1)
-                        fig_all_trends.add_hline(y=THRESHOLDS[s_config['threshold_key']]['critical_max'], line_dash="dash", line_color="red", row=i+1, col=1)
-                    
-                    fig_all_trends.update_yaxes(title_text=s_config['unit'], row=i+1, col=1)
-
-                fig_all_trends.update_layout(height=800, title_text="Live Trend Data Across All Brake Sensors", showlegend=False)
-                st.plotly_chart(fig_all_trends, use_container_width=True)
-
-
-            with tab_pressure:
-                create_sensor_dashboard_section('brake_pressure', SENSOR_CONFIG['brake_pressure'], latest_data, df)
-
-            with tab_temp:
-                create_sensor_dashboard_section('brake_temperature', SENSOR_CONFIG['brake_temperature'], latest_data, df)
-
-            with tab_pad_wear:
-                create_sensor_dashboard_section('brake_pad_wear', SENSOR_CONFIG['brake_pad_wear'], latest_data, df)
-
-            with tab_response_time:
-                create_sensor_dashboard_section('brake_response_time', SENSOR_CONFIG['brake_response_time'], latest_data, df)
-
-            with tab_predictive:
-                st.header("🧠 Predictive Maintenance & Anomaly Detection")
-                if st.session_state.latest_prediction:
-                    pred = st.session_state.latest_prediction
-                    col_pred1, col_pred2, col_pred3 = st.columns(3)
-                    
-                    pred_card_color = "lightgreen"
-                    if pred['condition'] == 'Warning':
-                        pred_card_color = "orange"
-                    elif pred['condition'] == 'Fault':
-                        pred_card_color = "red"
-
-                    with col_pred1:
-                        st.markdown(f"""
-                        <div style="background-color: {pred_card_color}; padding: 15px; border-radius: 10px; text-align: center; color: white;">
-                            <h4>Predicted Brake Health</h4>
-                            <h2>{pred['condition']}</h2>
-                            <p>Confidence: {pred['confidence']:.1f}%</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    with col_pred2:
-                        st.info(f"""
-                        **Estimated Remaining Useful Life (RUL)**
-                        ## {pred['rul']} Hours
-                        """)
-                    
-                    with col_pred3:
-                        st.info(f"""
-                        **Anomaly Count**
-                        ## {st.session_state.anomaly_count}
-                        """)
-                    
-                    if show_ml_metrics:
-                        st.subheader("ML Model Performance")
-                        st.metric("Model Accuracy", f"{st.session_state.model_accuracy:.1f}%")
-                        st.markdown("*(Accuracy based on recent historical data)*")
-
-                else:
-                    st.info("ML model predictions will appear here after sufficient data is collected and models are trained. Please wait or click 'TRAIN ML MODELS NOW'.")
-
-            if show_raw_data:
-                st.subheader("Raw Data Table (Last 20 readings)")
-                st.dataframe(df.tail(20), use_container_width=True)
-
-        # Control the refresh rate of the Streamlit app
-        time.sleep(CONFIG['sim_interval'])
-        st.rerun() # Trigger a rerun to update the dashboard with new data
+    # Render the main dashboard content
+    render_dashboard_content(show_raw_data, show_ml_metrics)
 
 
 if __name__ == "__main__":
