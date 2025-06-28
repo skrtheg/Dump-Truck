@@ -9,8 +9,6 @@ services:
       - "8503:8503"  # Engine System
       - "8504:8504"  # Tire System
       - "8505:8505"  # Vibration Analysis
-    environment:
-      - PYTHONUNBUFFERED=1
     env_file:
       - .env
     restart: unless-stopped

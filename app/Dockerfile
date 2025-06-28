@@ -8,13 +8,6 @@ ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 
-# Install system dependencies needed for lsof, process management, and health checks
-RUN apt-get update && apt-get install -y \
-    procps \
-    lsof \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
