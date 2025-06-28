@@ -11,5 +11,16 @@ services:
       - "8505:8505"  # Vibration Analysis
     environment:
       - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
     restart: unless-stopped
-    
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 3600 --cleanup --stop-timeout 60s app
